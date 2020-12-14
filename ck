@@ -101,6 +101,24 @@ def ck(ctx, config_file, verbose):
         ctx.obj['MarkdownEditor']             = config['default']['MarkdownEditor']
         ctx.obj['TagAfterCkAddConflict']      = config['default']['TagAfterCkAddConflict'].lower() == "true"
         ctx.obj['tags']                       = find_tagged_pdfs(ctx.obj['TagDir'], verbose)
+
+        # Maps domain of website to function that handles downloading paper's PDF & BibTeX from it
+        #
+        # TODO(Alex): Change to regex matching
+        # NOTE(Alin): Sure, but for now might be overkill: the only time we need it is for [www.]sciencedirect.com
+        #
+        # TODO(Alex): Incorporate Zotero translators (see https://www.zotero.org/support/translators)
+        ctx.obj['handlers'] = {
+            "link.springer.com"     : springerlink_handler,
+            "arxiv.org"             : arxiv_handler,
+            "rd.springer.com"       : springerlink_handler,
+            "eprint.iacr.org"       : iacreprint_handler,
+            "dl.acm.org"            : dlacm_handler,
+            "epubs.siam.org"        : epubssiam_handler,
+            "ieeexplore.ieee.org"   : ieeexplore_handler,
+            "www.sciencedirect.com" : sciencedirect_handler,
+            "sciencedirect.com"     : sciencedirect_handler,
+        }
     except:
         print_error("Config file '" + config_file + "' is in bad shape. Please edit manually!")
         raise
@@ -144,7 +162,7 @@ def ck_check(ck_bib_dir, ck_tag_dir, verbosity):
     counterpart_ext['.bib'] = '.pdf'
 
     extensions = missing.keys()
-    for ck in list_cks(ck_bib_dir):
+    for ck in list_cks(ck_bib_dir, False):
         for ext in extensions:
             filepath = os.path.join(ck_bib_dir, ck + ext)
 
@@ -193,6 +211,53 @@ def abort_citation_exists(ctx, destpdffile, citation_key):
             # prompt user to tag paper
             ctx.invoke(ck_tag_cmd, citation_key=citation_key)
 
+@ck.command('addbib')
+@click.argument('url', required=True, type=click.STRING)
+@click.argument('citation_key', required=False, type=click.STRING)
+@click.pass_context
+def ck_addbib_cmd(ctx, url, citation_key):
+    """Adds the paper's .bib file to the library, without a PDF file,
+       unless one already exists. Uses the specified citation key, if given.
+       Otherwise, uses the DefaultCk policy in the configuration file."""
+
+    verbosity        = ctx.obj['verbosity']
+    handlers         = ctx.obj['handlers']
+    default_ck       = ctx.obj['DefaultCk']
+    ck_bib_dir       = ctx.obj['BibDir']
+    ck_tag_dir       = ctx.obj['TagDir']
+
+    # Sets up a HTTP URL opener object, with a random UserAgent to prevent various
+    # websites from borking.
+    cj = CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    user_agent = UserAgent().random
+
+    # Download .bib file only
+    is_handled, bibtex, _ = handle_url(url, handlers, opener, user_agent, verbosity, True, False)
+
+    if not is_handled:
+        click.echo("No handler for URL was found. Expecting this URL to be to a .bib file...")
+        bibtex = download_bib(opener, user_agent, url, verbosity)
+
+    if verbosity > 0:
+        print("Downloaded BibTeX: " + str(bibtex))
+
+    citation_key, bibent = bibtex_to_bibent_with_ck(bibtex, citation_key, default_ck, verbosity)
+    click.echo("Will use citation key: ", nl=False)
+    click.secho(citation_key, fg="blue")
+
+    destbibfile = ck_to_bib(ck_bib_dir, citation_key)
+
+    # Write the .bib file
+    # (except for the case where it this is a non-handled URL and a .bib file exists)
+    if not os.path.exists(destbibfile):
+        # First, sets the 'ckdateadded' field in the .bib file
+        bibent_set_dateadded(bibent, None)
+        bibent_to_file(destbibfile, bibent)
+    else:
+        print_error("Citation key " + citation_key + " already exists")
+        sys.exit(1)
+
 @ck.command('add')
 @click.argument('url', required=True, type=click.STRING)
 @click.argument('citation_key', required=False, type=click.STRING)
@@ -210,67 +275,21 @@ def ck_add_cmd(ctx, url, citation_key, no_tag_prompt):
 
     ctx.ensure_object(dict)
     verbosity        = ctx.obj['verbosity']
+    handlers         = ctx.obj['handlers']
     default_ck       = ctx.obj['DefaultCk']
     ck_bib_dir       = ctx.obj['BibDir']
     ck_tag_dir       = ctx.obj['TagDir']
 
-    parsed_url = urlparse(url)
-    if verbosity > 0:
-        print("Paper's URL:", parsed_url)
-
-    # get domain of website and handle it accordingly
-    #
-    # TODO(Alex): Change to regex matching
-    # NOTE(Alin): Sure, but for now might be overkill: the only time we need it is for [www.]sciencedirect.com
-    #
-    # TODO(Alex): Incorporate Zotero translators (see https://www.zotero.org/support/translators)
-    handlers = {
-        "link.springer.com"     : springerlink_handler,
-        "arxiv.org"             : arxiv_handler,
-        "rd.springer.com"       : springerlink_handler,
-        "eprint.iacr.org"       : iacreprint_handler,
-        "dl.acm.org"            : dlacm_handler,
-        "epubs.siam.org"        : epubssiam_handler,
-        "ieeexplore.ieee.org"   : ieeexplore_handler,
-        "www.sciencedirect.com" : sciencedirect_handler,
-        "sciencedirect.com"     : sciencedirect_handler,
-    }
-
-    # For most handled URLs, the handlers get a parsed index.html object. But,
-    # for others (e.g., IACR ePrint), the handler doesn't need to parse the
-    # page at all since the .pdf and .bib file links are derived directly from
-    # the URL itself.
-    no_index_html = set()
-    no_index_html.add("eprint.iacr.org")
-
     # Sets up a HTTP URL opener object, with a random UserAgent to prevent various
     # websites from borking.
-    domain = parsed_url.netloc
     cj = CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
     user_agent = UserAgent().random
 
-    # This is used to initialize the BeautifoulSoup HTML parser.
-    parser = "lxml" 
+    # Download PDF (and potentially .bib file too, if the URL is handled)
+    is_handled, bibtex, pdf_data = handle_url(url, handlers, opener, user_agent, verbosity, True, True)
 
-    # The PDF and .bib data will be stored in these variables before being written to disk
-    pdf_data = None
-    bibtex = None
-
-    # Download PDF (and potentially .bib file too)
-    is_handled_url = domain in handlers
-    if is_handled_url:
-        soup = None
-        index_html = None
-
-        # e.g., We don't need to download the index.html page for IACR ePrint
-        if domain not in no_index_html:
-            index_html = get_url(opener, url, verbosity, user_agent)
-            soup = BeautifulSoup(index_html, parser)
-
-        handler = handlers[domain]
-        bibtex, pdf_data = handler(opener, soup, parsed_url, ck_bib_dir, parser, user_agent, verbosity)
-    else:
+    if not is_handled:
         click.echo("No handler for URL was found. This is a PDF-only download, so expecting user to give a citation key.")
         
         # If no citation key is given, fail because we can't check .bib file exists until after
@@ -306,7 +325,8 @@ def ck_add_cmd(ctx, url, citation_key, no_tag_prompt):
                 print_error("You must add author(s), year and title to the .bib file.")
                 sys.exit(1)
         else:
-            bibtex = file_to_string(bibpath_tmp)
+            # WARNING: Code below expects bibtex to be bytes that it can call .decode() on
+            bibtex = file_to_bytes(bibpath_tmp)
 
     #
     # Invariant: We have the PDF data in pdf_data and the .bib data in bibtex.
@@ -315,34 +335,10 @@ def ck_add_cmd(ctx, url, citation_key, no_tag_prompt):
     #            Either way, we are ready to check the paper does not exist and, if so, save the files.
     #
 
-    # Parse the BibTeX into an object
-    bibent = defaultdict(lambda : '', bibtex_to_bibent(bibtex.decode()))
+    citation_key, bibent = bibtex_to_bibent_with_ck(bibtex, citation_key, default_ck, verbosity)
     bibtex = None # make sure we never use this again
-
-    # If no citation key was given as argument, use the DefaultCk policy from the configuration file.
-    # NOTE(Alin): Non-handled URLs always have a citation key, so we need not worry about them.
-    if not citation_key:
-        # We use the DefaultCk policy from the configuration file to determine the citation key, if none was given
-        if default_ck == "KeepBibtex":
-            citation_key = bibent['ID']
-        elif default_ck == "FirstAuthorYearTitle":
-            citation_key = bibent_get_first_author_year_title_ck(bibent)
-        elif default_ck == "InitialsShortYear":
-            citation_key = bibent_get_author_initials_ck(bibent)
-            citation_key += bibent['year'][-2:]
-        elif default_ck == "InitialsFullYear":
-            citation_key = bibent_get_author_initials_ck(bibent)
-            citation_key += bibent['year']
-        else:
-            print_error("Unknown default citation key policy in configuration file: " + default_ck)
-            sys.exit(1)
-            
-        # Something went wrong if the citation key is empty, so exit.
-        assert len(citation_key) > 0
-
-    # Set the citation key in the BibTeX object
-    click.secho('Will use citation key: %s' % citation_key, fg="yellow")
-    bibent['ID'] = citation_key
+    click.echo("Will use citation key: ", nl=False)
+    click.secho(citation_key, fg="blue")
     
     # Derive PDF and .bib file paths from citation key.
     destpdffile = ck_to_pdf(ck_bib_dir, citation_key)
@@ -361,7 +357,7 @@ def ck_add_cmd(ctx, url, citation_key, no_tag_prompt):
     # TODO(Alin): This makes the flow of 'ck add' too complicated to follow.
     # We should simplify it by adding 'ck updatepdf' and 'ck updatebib' as commands used to update the .bib and .pdf files explicitly.
     # Then, 'ck add' should always check that neither a PDF nor a .bib file exists.
-    if is_handled_url and os.path.exists(destbibfile):
+    if is_handled and os.path.exists(destbibfile):
         abort_citation_exists(ctx, destbibfile, citation_key)
         sys.exit(1)
     
@@ -378,8 +374,9 @@ def ck_add_cmd(ctx, url, citation_key, no_tag_prompt):
 
     # Prompt the user to tag the paper
     if not no_tag_prompt:
-        # TODO(Alin): Print abstract, authors, year & title to the user and prompt user for tags!
-        ctx.invoke(ck_tag_cmd, citation_key=citation_key)
+        # First, open the PDF so the user can read it before asking them for the tags
+        ctx.invoke(ck_open_cmd, filename=citation_key)
+        ctx.invoke(ck_tag_cmd, citation_key=citation_key, silent=True)
 
 @ck.command('config')
 @click.option(
@@ -472,6 +469,8 @@ def ck_finished_cmd(ctx, citation_key):
         ctx.invoke(ck_list_cmd, pathnames=[os.path.join(ck_tag_dir, 'queue/finished')])
 
 @ck.command('untag')
+@click.argument('citation_key', required=False, type=click.STRING)
+@click.argument('tags', required=False, nargs=-1, type=click.STRING)
 @click.option(
     '-f', '--force',
     is_flag=True,
@@ -482,8 +481,6 @@ def ck_finished_cmd(ctx, citation_key):
     is_flag=True,
     default=False,
     help='Does not display error message when paper was not tagged.')
-@click.argument('citation_key', required=False, type=click.STRING)
-@click.argument('tags', required=False, type=click.STRING)
 @click.pass_context
 def ck_untag_cmd(ctx, force, silent, citation_key, tags):
     """Untags the specified paper."""
@@ -494,9 +491,9 @@ def ck_untag_cmd(ctx, force, silent, citation_key, tags):
     ck_tag_dir = ctx.obj['TagDir']
     ck_tags    = ctx.obj['tags']
         
-    if citation_key is None and tags is None:
+    if citation_key is None and len(tags) == 0:
         # If no paper was specified, detects untagged papers and asks the user to tag them.
-        untagged_pdfs = find_untagged_pdfs(ck_bib_dir, ck_tag_dir, list_cks(ck_bib_dir), ck_tags.keys(), verbosity)
+        untagged_pdfs = find_untagged_pdfs(ck_bib_dir, ck_tag_dir, list_cks(ck_bib_dir, False), ck_tags.keys(), verbosity)
         if len(untagged_pdfs) > 0:
             sys.stdout.write("Untagged papers:\n")
             for (filepath, citation_key) in untagged_pdfs:
@@ -510,8 +507,7 @@ def ck_untag_cmd(ctx, force, silent, citation_key, tags):
         else:
             click.echo("No untagged papers.")
     else:
-        if tags is not None:
-            tags = parse_tags(tags)
+        if len(tags) != 0:
             for tag in tags:
                 if untag_paper(ck_tag_dir, citation_key, tag):
                     click.secho("Removed '" + tag + "' tag", fg="green")
@@ -539,7 +535,8 @@ def ck_info_cmd(ctx, citation_key):
     ck_tags    = ctx.obj['tags']
 
     include_url = True
-    print_ck_tuples(cks_to_tuples(ck_bib_dir, [ citation_key ], verbosity), ck_tags, include_url)
+    include_venue = True
+    print_ck_tuples(cks_to_tuples(ck_bib_dir, [ citation_key ], verbosity), ck_tags, include_url, include_venue)
 
 @ck.command('sync')
 @click.pass_context
@@ -549,9 +546,10 @@ def ck_sync_tags(ctx):
 
 
 @ck.command('tags')
+@click.argument('matching_tag', required=False, type=click.STRING)
 @click.pass_context
-def ck_tags_cmd(ctx):
-    """Lists all tags in the library"""
+def ck_tags_cmd(ctx, matching_tag):
+    """Lists all tags in the library. If a <tag> is given as argument, prints matching tags in the library."""
 
     ctx.ensure_object(dict)
     verbosity  = ctx.obj['verbosity']
@@ -559,16 +557,29 @@ def ck_tags_cmd(ctx):
     ck_tag_dir = ctx.obj['TagDir']
     ck_tags    = ctx.obj['tags']
 
-    print_all_tags(ck_tag_dir)
+    tags = get_all_tags(ck_tag_dir)
+    if matching_tag is None:
+        print_tags(tags)
+    else:
+        matching = []
+        for t in tags:
+            if matching_tag in t:
+                matching.append(t)
+
+        if len(matching) > 0:
+            click.echo("Tags matching '" + matching_tag + "': ", nl=False)
+            print_tags(matching)
+        else:
+            click.secho("No tags matching '" + matching_tag + "' in library.", fg='yellow')
 
 @ck.command('tag')
+@click.argument('citation_key', required=True, type=click.STRING)
+@click.argument('tags', required=False, nargs=-1, type=click.STRING)
 @click.option(
     '-s', '--silent',
     is_flag=True,
     default=False,
     help='Does not display error message when paper is already tagged.')
-@click.argument('citation_key', required=True, type=click.STRING)
-@click.argument('tags', required=False, type=click.STRING)
 @click.pass_context
 def ck_tag_cmd(ctx, silent, citation_key, tags):
     """Tags the specified paper"""
@@ -582,13 +593,14 @@ def ck_tag_cmd(ctx, silent, citation_key, tags):
     #if not silent:
     #    click.echo("Tagging '" + style_ck(citation_key) + "' with " + style_tags(tags) + "...")
 
-    ctx.invoke(ck_info_cmd, citation_key=citation_key)
+    if not silent:
+        ctx.invoke(ck_info_cmd, citation_key=citation_key)
 
     if not ck_exists(ck_bib_dir, citation_key):
         print_error(citation_key + " has no PDF file.")
         sys.exit(1)
 
-    if tags is None:
+    if len(tags) == 0:
         completed = subprocess.run(
             ['which pdfgrep'],
             shell=True,
@@ -596,17 +608,36 @@ def ck_tag_cmd(ctx, silent, citation_key, tags):
             stderr=subprocess.DEVNULL,
         )
 
+        tags = get_all_tags(ck_tag_dir)
+
         if completed.returncode != 0: 
             print_warning("Not suggesting any tags because 'pdfgrep' is not installed.")
-        else:
-            tags = get_all_tags(ck_tag_dir)
+        elif len(tags) > 0:
+            # NOTE(Alin): Tags can be hierarchical, e.g.,, 'accumulators/merkle', so we split them up into separate words by '/'
+            words = set()
+            for t in tags:
+                for w in t.split('/'):
+                    words.add(w)
+            pattern = ' -e '.join(sorted(words))
+            pattern = '-e ' + pattern
             suggested_tags = []
-            tag_extended_regex = '|'.join([ r'\b{}\b'.format(
-                '|'.join(t.split('/'))
-            ) for t in tags])
+            
+#<<<<<<< HEAD
+#            tag_extended_regex = '|'.join([ r'\b{}\b'.format(
+#                '|'.join(t.split('/'))
+#            ) for t in tags])
+#=======
+#>>>>>>> upstream/master
 
             try:
-                matches = subprocess.check_output("pdfgrep '%s' %s" % (tag_extended_regex, ck_to_pdf(ck_bib_dir, citation_key)), shell=True).decode()
+                pdfpath = ck_to_pdf(ck_bib_dir, citation_key)
+                if verbosity > 1:
+                    click.echo("Calling pdfgrep " + pattern + " '" + pdfpath + "'")
+
+                matches = subprocess.check_output("pdfgrep %s %s" % (pattern, pdfpath), shell=True).decode()
+
+                if verbosity > 1:
+                    click.echo("pdfgrep returned matches: " + matches)
             except subprocess.CalledProcessError as e:
                 print_warning("Not suggesting any tags because 'pdfgrep' returned with non-zero return code: " + str(e.returncode))
                 matches = ''
@@ -616,15 +647,14 @@ def ck_tag_cmd(ctx, silent, citation_key, tags):
                     suggested_tags.append((tag, matches.count(tag)))
 
             suggested_tags = sorted(suggested_tags, key=lambda x: x[1], reverse=True)
+            suggested_tags = [st[0] for st in suggested_tags]
 
             if len(suggested_tags) > 0:
-                click.secho("Suggested tags: " + ','.join([x[0] for x in suggested_tags]), fg="cyan")
+                click.echo("Suggested tags: ", nl=False)
+                print_tags(suggested_tags)
 
         # returns array of tags
         tags = prompt_for_tags(ctx, "Please enter tag(s) for '" + click.style(citation_key, fg="blue") + "'")
-    else:
-        # parses comma-separated tag string into an array of tags
-        tags = parse_tags(tags)
 
     for tag in tags:
         if tag_paper(ck_tag_dir, ck_bib_dir, citation_key, tag):
@@ -635,13 +665,13 @@ def ck_tag_cmd(ctx, silent, citation_key, tags):
                 click.secho(citation_key + " already has '" + tag + "' tag", fg="red", err=True)
 
 @ck.command('rm')
+@click.argument('citation_key', required=True, type=click.STRING)
 @click.option(
     '-f', '--force',
     is_flag=True,
     default=False,
     help='Do not prompt for confirmation before deleting'
     )
-@click.argument('citation_key', required=True, type=click.STRING)
 @click.pass_context
 def ck_rm_cmd(ctx, force, citation_key):
     """Removes the paper from the library (.pdf and .bib file). Can provide citation key or filename with .pdf or .bib extension."""
@@ -747,7 +777,8 @@ def ck_open_cmd(ctx, filename):
             except:
                 print_warning("Could not parse BibTeX:")
                 traceback.print_exc()
-
+    elif extension.lower() == '.tex':
+        os.system(ck_text_editor + " " + fullpath)
     elif extension.lower() == '.md':
         # NOTE: Need to cd to the directory first so vim picks up the .vimrc there
         os.system('cd "' + ck_bib_dir + '" && ' + ck_markdown_editor + ' "' + filename + '"')
@@ -802,8 +833,8 @@ def ck_bib_cmd(ctx, citation_key, clipboard, markdown):
     has_abstract = False
 
     if not markdown:
-        print("BibTeX for '%s'" % path)
-        print()
+        click.echo("BibTeX for '%s'" % path, err=True)
+        click.echo()
 
         # We print the full thing!
         to_print = bibent_to_bibtex(bibent)
@@ -821,15 +852,7 @@ def ck_bib_cmd(ctx, citation_key, clipboard, markdown):
         citation_key_noplus = citation_key.replace("+", "plus") # beautiful-jekyll is not that beautiful and doesn't like '+' in footnote names
         to_copy = "[^" + citation_key_noplus + "]: **" + title + "**, by " + authors
 
-        if 'booktitle' in bibent:
-            venue = bibent['booktitle']
-        elif 'journal' in bibent:
-            venue = bibent['journal']
-        elif 'howpublished' in bibent and "\\url" not in bibent['howpublished']:
-            venue = bibent['howpublished']
-        else:
-            venue = None
-
+        venue = bibent_get_venue(bibent)
         if venue != None:
             to_copy = to_copy + ", *in " + venue + "*"
 
@@ -847,11 +870,12 @@ def ck_bib_cmd(ctx, citation_key, clipboard, markdown):
 
     if clipboard:
         pyperclip.copy(to_copy)
-        click.echo()
+        click.echo(err=True)
+        # NOTE: We print to stderr since we want to allow the user to send the BibTeX output of 'ck genbib TXN20 >>references.bib' to a .bib file.
         if markdown or not has_abstract:
-            print_success("Copied to clipboard!")
+            click.echo("Copied to clipboard!", err=True)
         else:
-            print_success("Copied to clipboard (without abstract)!")
+            click.echo("Copied to clipboard (without abstract)!", err=True)
 
 @ck.command('rename')
 @click.argument('old_citation_key', required=True, type=click.STRING)
@@ -890,8 +914,7 @@ def ck_rename_cmd(ctx, old_citation_key, new_citation_key):
         # replaces only the 1st occurrence of the old CK to deal with the (astronomically-rare?)
         # event where the old CK appears multiple times in the filename
         newfilename = oldfilename.replace(old_citation_key, new_citation_key, 1)
-        if verbosity > 0:
-            click.echo("Renaming '" + oldfilename + ext + "' to '" + newfilename + ext + "' in " + ck_bib_dir)
+        click.echo("Renaming '" + oldfilename + ext + "' to '" + newfilename + ext + "' in " + ck_bib_dir)
 
         # rename file in BibDir
         os.rename(
@@ -899,20 +922,19 @@ def ck_rename_cmd(ctx, old_citation_key, new_citation_key):
             os.path.join(ck_bib_dir, newfilename + ext))
 
     # update .bib file citation key
-    if verbosity > 0:
-        click.echo("Renaming CK in .bib file...")
+    click.echo("Renaming CK in .bib file...")
     bibpath_rename_ck(ck_to_bib(ck_bib_dir, new_citation_key), new_citation_key)
 
-    # update all symlinks in TagDir by un-tagging and re-tagging
-    if verbosity > 0:
+    # if the paper is tagged, update all symlinks in TagDir by un-tagging and re-tagging
+    if old_citation_key in ck_tags:
         click.echo("Recreating tag information...")
-    tags = ck_tags[old_citation_key]
-    for tag in tags:
-        if not untag_paper(ck_tag_dir, old_citation_key, tag):
-            print_warning("Could not remove '" + tag + "' tag")
+        tags = ck_tags[old_citation_key]
+        for tag in tags:
+            if not untag_paper(ck_tag_dir, old_citation_key, tag):
+                print_warning("Could not remove '" + tag + "' tag")
 
-        if not tag_paper(ck_tag_dir, ck_bib_dir, new_citation_key, tag):
-            print_warning("Already has '" + tag + "' tag")
+            if not tag_paper(ck_tag_dir, ck_bib_dir, new_citation_key, tag):
+                print_warning("Already has '" + tag + "' tag")
 
 @ck.command('search')
 @click.argument('query', required=True, type=click.STRING)
@@ -949,7 +971,8 @@ def ck_search_cmd(ctx, query, case_sensitive):
 
     if len(cks) > 0:
         include_url = True
-        print_ck_tuples(cks_to_tuples(ck_bib_dir, cks, verbosity), ck_tags, include_url)
+        include_venue = True
+        print_ck_tuples(cks_to_tuples(ck_bib_dir, cks, verbosity), ck_tags, include_url, include_venue)
     else:
         print("No matches!")
 
@@ -963,7 +986,7 @@ def ck_cleanbib_cmd(ctx):
     ck_bib_dir = ctx.obj['BibDir']
     ck_tag_dir = os.path.normpath(os.path.realpath(ctx.obj['TagDir']))
 
-    cks = list_cks(ck_bib_dir)
+    cks = list_cks(ck_bib_dir, False)
 
     for ck in cks:
         bibfile = ck_to_bib(ck_bib_dir, ck)
@@ -994,15 +1017,13 @@ def ck_cleanbib_cmd(ctx):
             traceback.print_exc()
 
 @ck.command('list')
-#@click.argument('directory', required=False, type=click.Path(exists=True, file_okay=False, dir_okay=True, resolve_path=True))
-#@click.argument('pathnames', nargs=-1, type=click.Path(exists=True, file_okay=True, dir_okay=True, resolve_path=True))
-@click.argument('pathnames', nargs=-1, type=click.STRING)
+@click.argument('tag_names_or_subdirs', nargs=-1, type=click.STRING)
 @click.option(
-    '-u', '--url',
+    '-r', '--recursive',
     is_flag=True,
     default=False,
-    help='Includes the URLs next to each paper'
-    )
+    help='Recursively lists all CKs in the specified location'
+)
 @click.option(
     '-s', '--short',
     is_flag=True,
@@ -1010,14 +1031,29 @@ def ck_cleanbib_cmd(ctx):
     help='Citation keys only'
 )
 @click.option(
-    '-r', '--relative', 'is_relative_to_tagdir',
+    '-t', '--tags', 'is_tags',
     is_flag=True,
     default=False,
-    help='Interprets all pathnames relative to TagDir'
+    help='Interprets all arguments as tags.'
 )
+@click.option(
+    '-u', '--url',
+    is_flag=True,
+    default=False,
+    help='Includes the URLs next to each paper'
+    )
 @click.pass_context
-def ck_list_cmd(ctx, pathnames, url, short, is_relative_to_tagdir):
-    """Lists all citation keys in the library. Pathnames can be a list of <citation-key>'s, a list of <tag>'s, a list of <tag>/<citation-key>'s (if -t is given) or it can be empty (to print all citation keys)."""
+# WARNING: The bash autocompletion script relies on this command working as it does now.
+# WARNING: Do not make this any more complicated than it is!
+#
+# This command serves three purposes right now, which is why it's a bit messy:
+# 1. Let the user navigate the TagDir via the command line by using 'ck l' and 'ck l <tag-or-subtag>'.
+# 2. List papers with specific tags via -t/--tags (which could be delegated to 'ck search' or some other command).
+# 3. List all papers in the library (when doing 'ck l' outside the TagDir)
+def ck_list_cmd(ctx, tag_names_or_subdirs, recursive, short, is_tags, url):
+    """Lists all citation keys in the specified subdirectories of TagDir or if -t/--tags is passed, all citation keys with the specified tags.
+
+    TAG_NAMES_OR_SUBDIRS is by default assumed to be a list of subdirectories of TagDir, but if -t/--tags is passed, then it is interpreted as a list of tags."""
 
     ctx.ensure_object(dict)
     verbosity  = ctx.obj['verbosity']
@@ -1025,99 +1061,121 @@ def ck_list_cmd(ctx, pathnames, url, short, is_relative_to_tagdir):
     ck_tag_dir = os.path.normpath(os.path.realpath(ctx.obj['TagDir']))
     ck_tags    = ctx.obj['tags']
 
-    cks = cks_from_paths(ck_bib_dir, ck_tag_dir, pathnames, is_relative_to_tagdir)
-    
-    if short:
-        print(' '.join(cks))
+    cks = set()
 
+    if is_tags:
+        # If arguments are tags, then list by tags
+        tags = tag_names_or_subdirs
+        cks.update(cks_from_tags(ck_tag_dir, tags, recursive))
     else:
-        if verbosity > 0:
-            print(cks)
+        subdirs = []
+        subdirs.extend(tag_names_or_subdirs)
+        if len(subdirs) == 0:
+            # If no TagDir subdir args were given, and...
+            if is_cwd_in_tagdir(ck_tag_dir):
+                # ...we are in the TagDir, list the current TagDir subdirectory
+                subdirs.append(os.getcwd())
+            else:
+                # ...we are NOT in the TagDir, list the BibDir
+                subdirs.append(ck_bib_dir)
 
+        for subdir in subdirs:
+            if os.path.exists(subdir):
+                cks.update(list_cks(subdir, recursive))
+            else:
+                print_warning("Directory '" + subdir + "' does not exist")
+
+    if short:
+        if len(cks) > 0:
+            click.echo(' '.join(sorted(cks)))
+    else:
         ck_tuples = cks_to_tuples(ck_bib_dir, cks, verbosity)
 
-        sorted_cks = sorted(ck_tuples, key=lambda item: item[4])
+        # NOTE: Currently sorts alphabetically by CK
+        sorted_cks = sorted(ck_tuples, key=lambda item: item[0])
     
         print_ck_tuples(sorted_cks, ck_tags, url)
 
-        print()
-        print(str(len(cks)) + " PDFs listed")
-
-    # TODO(Alin): query could be a space-separated list of tokens
-    # a token can be a hashtag (e.g., #dkg-dlog) or a sorting token (e.g., 'year')
-    # For example: 
-    #  $ ck l #dkg-dlog year title
-    # would list all papers with tag #dkg-dlog and sort them by year and then by title
-    # TODO(Alin): could have AND / OR operators for hashtags
-    # TODO(Alin): filter by year/author/title/conference
+        click.echo(str(len(cks)) + " PDFs listed")
 
 @ck.command('genbib')
-@click.argument('output-bibtex-file', required=True, type=click.File('w'))
-@click.argument('pathnames', nargs=-1, type=click.Path(exists=True, file_okay=True, dir_okay=True, resolve_path=True))
+@click.argument('output-bibtex-file', required=True, type=click.File('a'))
+@click.argument('tags', required=False, nargs=-1, type=click.STRING)
 @click.option(
-    '-r', '--relative', 'is_relative_to_tagdir',
+    '-r', '--recursive',
     is_flag=True,
     default=False,
-    help='Interprets all pathnames relative to TagDir'
+    help='Includes CKs that are recursively-tagged too.'
 )
 @click.pass_context
-def ck_genbib(ctx, output_bibtex_file, pathnames, is_relative_to_tagdir):
-    """Generates a master bibliography file of all papers. Pathnames can be a list of <citation-key>'s, a list of <tag>'s, a list of <tag>/<citation-key>'s (if -t is given) or it can be empty (to indicate all citation keys should be exported)."""
+def ck_genbib(ctx, output_bibtex_file, tags, recursive):
+    """Generates a .bib file of papers tagged with the specified tags.
+       If the specified .bib file already exists, just appends to it.
+       If no tags are given, generates a .bib file of all papers in the BibDir."""
 
     ctx.ensure_object(dict)
     verbosity  = ctx.obj['verbosity']
     ck_bib_dir = ctx.obj['BibDir']
     ck_tag_dir = ctx.obj['TagDir']
 
-    cks = cks_from_paths(ck_bib_dir, ck_tag_dir, pathnames, is_relative_to_tagdir)
+    tags = tags_filter_whitespace(tags)
 
-    num = 0
-    sortedcks = sorted(cks)
-    for ck in sortedcks:
+    if len(tags) == 0:
+        cks = list_cks(ck_bib_dir, False)
+    else:
+        cks = cks_from_tags(ck_tag_dir, tags, recursive)
+
+    num_copied = 0
+    for ck in cks:
         bibfilepath = ck_to_bib(ck_bib_dir, ck)
 
         if os.path.exists(bibfilepath):
-            num += 1
+            num_copied += 1
             bibtex = file_to_string(bibfilepath)
             output_bibtex_file.write(bibtex + '\n')
 
-    if num == 0:
-        print("No .bib files in specified directories.")
+    if num_copied == 0:
+        print_warning("No BibTeX entries were written to '" + output_bibtex_file.name + "'")
     else:
-        print("Wrote", num, ".bib files to", output_bibtex_file.name)
+        print_success("Wrote " + str(num_copied) + " BibTeX entries to '" + output_bibtex_file.name + "'")
 
 @ck.command('copypdfs')
 @click.argument('output-dir', required=True, type=click.Path(exists=True, file_okay=False, dir_okay=True, resolve_path=True))
-@click.argument('pathnames', nargs=-1, type=click.Path(exists=True, file_okay=True, dir_okay=True, resolve_path=True))
+@click.argument('tags', required=True, nargs=-1, type=click.STRING)
 @click.option(
-    '-r', '--relative', 'is_relative_to_tagdir',
+    '-r', '--recursive',
     is_flag=True,
     default=False,
-    help='Interprets all pathnames relative to TagDir'
+    help='Copies CKs that are recursively-tagged too.'
 )
 @click.pass_context
-def ck_copypdfs(ctx, output_dir, pathnames, is_relative_to_tagdir):
-    """Copies all PDFs from the specified pathnames into the output directory. Pathnames can be a list of <citation-key>'s, a list of <tag>'s, a list of <tag>/<citation-key>'s (if -t is given) or it can be empty (to copy all citation keys)."""
+def ck_copypdfs(ctx, output_dir, tags, recursive):
+    """Copies all PDFs tagged with the specified tags into the specified output directory.""" 
 
     ctx.ensure_object(dict)
     verbosity  = ctx.obj['verbosity']
     ck_bib_dir = ctx.obj['BibDir']
     ck_tag_dir = ctx.obj['TagDir']
 
-    cks = cks_from_paths(ck_bib_dir, ck_tag_dir, pathnames, is_relative_to_tagdir)
+    tags = tags_filter_whitespace(tags)
+    cks = cks_from_tags(ck_tag_dir, tags, recursive)
 
-    num = 0
-    sortedcks = sorted(cks)
-    for ck in sortedcks:
-
+    num_copied = 0
+    for ck in cks:
         if ck_exists(ck_bib_dir, ck):
-            num += 1
-            shutil.copy2(ck_to_pdf(ck_bib_dir, ck), output_dir)
+            destfile = os.path.join(output_dir, ck + ".pdf")
+            if not os.path.exists(destfile):
+                shutil.copy2(ck_to_pdf(ck_bib_dir, ck), output_dir)
+                num_copied += 1
+            else:
+                print_warning("PDF for " + ck + " already exists in " + output_dir)
+        else:
+            print_warning(style_ck(ck) + " PDF not found in '" + ck_bib_dir + "'")
 
-    if num == 0:
-        print("No .pdf files in specified directories.")
+    if num_copied == 0:
+        print_warning("No PDFs were copied.")
     else:
-        print("Copied", num, ".pdf files to", output_dir)
+        print_success("Copied " + str(num_copied) + " PDFs to '" + output_dir + "'")
 
 if __name__ == '__main__':
     ck(obj={})

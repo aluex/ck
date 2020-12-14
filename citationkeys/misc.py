@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import datetime
 from pprint import pprint
 from .tags import style_tags
-from .bib import bibent_get_url
+from .bib import bibent_get_url, bibent_get_venue
 
 # NOTE: Alphabetical order please
 import bibtexparser
@@ -27,7 +27,13 @@ def notimplemented():
 def file_to_string(path):
     with open(path, 'r') as f:
         data = f.read()
-    
+
+    return data
+
+def file_to_bytes(path):
+    with open(path, 'rb') as f:
+        data = f.read()
+
     return data
 
 def string_to_file(string, path):
@@ -45,44 +51,23 @@ def ck_exists(ck_bib_dir, ck):
     path = ck_to_pdf(ck_bib_dir, ck)
     return os.path.exists(path)
 
-# useful for commands like 'ck list' and 'ck genbib'
-# 1. When no path is given
-#   1.1. if in TagDir, list CKs in all subdirs
-#   1.2. if not in TagDir, list *all* CKs in BibDir
-# 2. When paths are given, list CKs in all those paths
-def cks_from_paths(ck_bib_dir, ck_tag_dir, pathnames, relative):
-    if relative:
-        pathnames = [ck_tag_dir + '/' + p for p in pathnames]
+def is_cwd_in_tagdir(ck_tag_dir):
+    cwd = os.path.normpath(os.getcwd())
+    common_prefix = os.path.commonpath([ck_tag_dir, cwd])
+    return common_prefix == ck_tag_dir
 
-    if len(pathnames) > 0:
-        cks = set()
-        for path in pathnames:
-            if os.path.isdir(path):
-                cks.update(list_cks(path))
-            else:
-                filename = os.path.basename(path)
-                ck, ext = os.path.splitext(filename)
-                cks.add(ck)
-    else:
-        # When listing with 'ck l', we have to figure out if the CWD is somewhere in the TagDir
-        # and if so, only list the CKs there. Otherwise, we list all CKs in the BibDir.
-        cwd = os.path.normpath(os.getcwd())
-        common_prefix = os.path.commonpath([ck_tag_dir, cwd])
-        is_in_tag_dir = (common_prefix == ck_tag_dir)
-
-        #print("CWD:               ", cwd)
-        #print("Tag dir:           ", ck_tag_dir)
-        #print("Is CWD in tag dir? ", is_in_tag_dir)
-        #print()
-
-        if is_in_tag_dir:
-            paper_dir=cwd
+# Given a list of tags, returns all citation keys with those tags.
+# If recursive is False, then does not include citation keys that are indirectly tagged.
+# For example, if the tag is #accumulators, and we have a CK tagged only with #accumulators/merkle
+# and not with #accumulators, then this CK will not be included when recursive=False.
+def cks_from_tags(ck_tag_dir, tags, recursive=True):
+    cks = set()
+    for tag in tags:
+        path = ck_tag_dir + '/' + tag
+        if os.path.isdir(path):
+            cks.update(list_cks(path, recursive))
         else:
-            paper_dir=ck_bib_dir
-
-        # Then, we can list the papers by tags below.
-        cks = list_cks(paper_dir)
-
+            print_error(style_tags([tag]) + " does not exist as a tag")
     return cks
 
 # TODO(Alin): Take flags that decide what to print. For now, "title, authors, year"
@@ -114,8 +99,9 @@ def cks_to_tuples(ck_bib_dir, cks, verbosity):
             year   = bib['year']
             date   = bib['ckdateadded'] if 'ckdateadded' in bib else ''
             url    = bibent_get_url(bib)
+            venue  = bibent_get_venue(bib)
 
-            ck_tuples.append((ck, author, title, year, date, url))
+            ck_tuples.append((ck, author, title, year, date, url, venue))
 
         except FileNotFoundError:
             click.secho(ck + ": Missing BibTeX file in directory " + ck_bib_dir, fg="red", err=True)
@@ -126,8 +112,8 @@ def cks_to_tuples(ck_bib_dir, cks, verbosity):
 
     return ck_tuples
 
-def print_ck_tuples(cks, tags, include_url=False):
-    for (ck, author, title, year, date, url) in cks:
+def print_ck_tuples(cks, tags, include_url=False, include_venue=False):
+    for (ck, author, title, year, date, url, venue) in cks:
         click.secho(ck, fg='blue', nl=False)
         click.echo(", ", nl=False)
         click.secho(title, fg='green', nl=False)
@@ -145,6 +131,10 @@ def print_ck_tuples(cks, tags, include_url=False):
             click.echo(', ', nl=False)
             click.echo(style_tags(tags[ck]), nl=False)
 
+        if include_venue and venue is not None:
+            click.echo(', ', nl=False)
+            click.secho(venue, fg='cyan', nl=False)
+
         if include_url and url is not None:
             click.echo(', ', nl=False)
             click.echo(url, nl=False)
@@ -153,14 +143,14 @@ def print_ck_tuples(cks, tags, include_url=False):
         #print(ck + ": " + title + " by " + author + ", " + year + date)
 
 # NOTE: This can be called on the bibdir or on the tagdir and it proceeds recursively
-def list_cks(ck_bib_dir):
+def list_cks(some_dir, recursive):
     cks = set()
 
-    for filename in sorted(os.listdir(ck_bib_dir)):
-        fullpath = os.path.join(ck_bib_dir, filename)
+    for filename in sorted(os.listdir(some_dir)):
+        fullpath = os.path.join(some_dir, filename)
 
-        if os.path.isdir(fullpath):
-            cks.update(list_cks(fullpath))
+        if recursive and os.path.isdir(fullpath):
+            cks.update(list_cks(fullpath, recursive))
         else:
             ck, ext = os.path.splitext(filename)
 

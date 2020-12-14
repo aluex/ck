@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 # NOTE: Alphabetical order please
+from collections import defaultdict
 from datetime import datetime
 from pprint import pprint
 from .tags import style_tags
@@ -99,6 +100,18 @@ def bibent_to_file(destbibfile, bibent):
     with open(destbibfile, 'w') as bibf:
         bibf.write(bibent_to_bibtex(bibent))
 
+def bibent_get_venue(bibent):
+    if 'booktitle' in bibent:
+        venue = bibent['booktitle']
+    elif 'journal' in bibent:
+        venue = bibent['journal']
+    elif 'howpublished' in bibent and "\\url" not in bibent['howpublished']:
+        venue = bibent['howpublished']
+    else:
+        venue = None
+
+    return venue
+
 # This takes a single 'bibtex[i]' entry (not a vector 'bibtex') as input
 def bibent_get_url(bibent):
     url = None
@@ -128,9 +141,13 @@ def bibent_get_first_author_year_title_ck(bibent):
     citation_key = ''.join([c for c in citation_key if c in string.ascii_lowercase or c in string.digits]) # filter out strange chars
     return citation_key
 
-def bibent_get_author_initials_ck(bibent):
+def bibent_get_author_initials_ck(bibent, verbosity):
+    # replace all newlines by space, so our ' and ' splitting works
+    bibent['author'] = bibent['author'].replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+
     allAuthors = bibent['author'].split(' and ')
-    print("all authors: ", allAuthors)
+    if verbosity > 0:
+        print("All authors \"" + bibent['author'] + "\" parsed to: ", allAuthors)
     moreThanFour = len(allAuthors) > 4
 
     # get the first four (or less) author names
@@ -139,26 +156,32 @@ def bibent_get_author_initials_ck(bibent):
     else:
         authors = allAuthors[:4]
 
-    print("authors: ", authors)
+    if verbosity > 0:
+        print("First 3+ authors: ", authors)
     # returns the last name (heuristically) from a string in either <first> <last> or <last>, <first> format
+
     def get_last_name(author):
         # NOTE(Alin): For now, we're restrict ourselves to simple names with A-Z letters only
-        regex = re.compile('[^ a-zA-Z]')
+        regex = re.compile('[^ ,a-zA-Z]')
         author = regex.sub('', author)
-        #print('getting last name of author: ', author)
 
         if ',' in author:
-            return author.split(',')[0]
+            last_name = author.split(',')[0]
         else:
-            return author.split(' ')[-1]
+            last_name = author.split(' ')[-1]
+
+        if verbosity > 0:
+            print("Last name of \"" + author + "\" is: " + last_name)
+
+        return last_name
 
     initials = ""
-    # For single authors, use the first three letters of their last name
+    # For single authors, use the first four letters of their last name
     # TODO(Alin): This won't work for Dutch authors with 'van' in their last name.
     # e.g., for 'van Damme', it will be either 'van' or 'Dam' but would be better to do 'vD' or something like that.
     if len(authors) == 1:
         last_name = get_last_name(authors[0])
-        initials = last_name[0:3]
+        initials = last_name[0:4]
     # For <= 4 authors, we use 'ABCD99'
     else:
         for author in authors:
@@ -182,6 +205,35 @@ def bibtex_to_bibdb(bibtex):
 def bibtex_to_bibent(bibtex):
     """Returns a bibliography object from a BibTeX string'"""
     return bibtex_to_bibdb(bibtex).entries[0]
+
+def bibtex_to_bibent_with_ck(bibtex, citation_key, default_ck_policy, verbosity):
+    bibent = defaultdict(lambda : '', bibtex_to_bibent(bibtex.decode()))
+
+    # If no citation key was given as argument, use the DefaultCk policy from the configuration file.
+    # NOTE(Alin): Non-handled URLs always have a citation key, so we need not worry about them.
+    if not citation_key:
+        # We use the DefaultCk policy from the configuration file to determine the citation key, if none was given
+        if default_ck_policy == "KeepBibtex":
+            citation_key = bibent['ID']
+        elif default_ck_policy == "FirstAuthorYearTitle":
+            citation_key = bibent_get_first_author_year_title_ck(bibent)
+        elif default_ck_policy == "InitialsShortYear":
+            citation_key = bibent_get_author_initials_ck(bibent, verbosity)
+            citation_key += bibent['year'][-2:]
+        elif default_ck_policy == "InitialsFullYear":
+            citation_key = bibent_get_author_initials_ck(bibent, verbosity)
+            citation_key += bibent['year']
+        else:
+            print_error("Unknown default citation key policy in configuration file: " + default_ck_policy)
+            sys.exit(1)
+
+        # Something went wrong if the citation key is empty, so exit.
+        assert len(citation_key) > 0
+
+    # Set the citation key in the BibTeX object
+    bibent['ID'] = citation_key
+
+    return citation_key, bibent
 
 def bibent_to_bibtex(bibent):
     """Returns a BibTeX string for the bibliography object'"""
