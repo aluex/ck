@@ -110,7 +110,8 @@ def handle_url(url, handlers, opener, user_agent, verbosity, bib_downl, pdf_down
     if domain in handlers:
         handler = handlers[domain]
         # NOTE: * expands the tuple returned by handler() into individual arguments
-        return True, *handler(opener, soup, parsed_url, parser, user_agent, verbosity, bib_downl, pdf_downl)
+        res = handler(opener, soup, parsed_url, parser, user_agent, verbosity, bib_downl, pdf_downl)
+        return True, res[0], res[1]
     else:
         return False, None, None
 

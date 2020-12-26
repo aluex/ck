@@ -617,7 +617,7 @@ def ck_tag_cmd(ctx, silent, citation_key, tags):
             words = set()
             for t in tags:
                 for w in t.split('/'):
-                    words.add(w)
+                    words.add('"' + w.replace('\\','') + '"')
             pattern = ' -e '.join(sorted(words))
             pattern = '-e ' + pattern
             suggested_tags = []
