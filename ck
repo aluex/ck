@@ -407,6 +407,7 @@ def ck_queue_cmd(ctx, citation_key):
     verbosity  = ctx.obj['verbosity']
     ck_bib_dir = ctx.obj['BibDir']
     ck_tag_dir = ctx.obj['TagDir']
+    # print(ctx.obj)
 
     if citation_key is not None:
         ctx.invoke(ck_tag_cmd, silent=True, citation_key=citation_key, tags="queue/to-read")
