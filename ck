@@ -1042,7 +1042,13 @@ def ck_cleanbib_cmd(ctx):
     is_flag=True,
     default=False,
     help='Includes the URLs next to each paper'
-    )
+)
+@click.option( # I want to update this to notion.so
+    '-c', '--csv',
+    is_flag=True,
+    default=False,
+    help='Export the items as CSV format'
+)
 @click.pass_context
 # WARNING: The bash autocompletion script relies on this command working as it does now.
 # WARNING: Do not make this any more complicated than it is!
@@ -1051,7 +1057,7 @@ def ck_cleanbib_cmd(ctx):
 # 1. Let the user navigate the TagDir via the command line by using 'ck l' and 'ck l <tag-or-subtag>'.
 # 2. List papers with specific tags via -t/--tags (which could be delegated to 'ck search' or some other command).
 # 3. List all papers in the library (when doing 'ck l' outside the TagDir)
-def ck_list_cmd(ctx, tag_names_or_subdirs, recursive, short, is_tags, url):
+def ck_list_cmd(ctx, tag_names_or_subdirs, recursive, short, is_tags, url, csv):
     """Lists all citation keys in the specified subdirectories of TagDir or if -t/--tags is passed, all citation keys with the specified tags.
 
     TAG_NAMES_OR_SUBDIRS is by default assumed to be a list of subdirectories of TagDir, but if -t/--tags is passed, then it is interpreted as a list of tags."""
@@ -1094,10 +1100,12 @@ def ck_list_cmd(ctx, tag_names_or_subdirs, recursive, short, is_tags, url):
 
         # NOTE: Currently sorts alphabetically by CK
         sorted_cks = sorted(ck_tuples, key=lambda item: item[0])
-    
-        print_ck_tuples(sorted_cks, ck_tags, url)
 
-        click.echo(str(len(cks)) + " PDFs listed")
+        if csv:
+            print_csv(sorted_cks, ck_tags, url)
+        else:
+            print_ck_tuples(sorted_cks, ck_tags, url)
+            click.echo(str(len(cks)) + " PDFs listed")
 
 @ck.command('genbib')
 @click.argument('output-file', required=True, type=click.File('a'))

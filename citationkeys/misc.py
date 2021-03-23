@@ -10,6 +10,7 @@ from .bib import bibent_get_url, bibent_get_venue, new_bibtex_parser
 # NOTE: Alphabetical order please
 import bibtexparser
 import click
+import csv
 import os
 import sys
 import traceback
@@ -110,6 +111,15 @@ def cks_to_tuples(ck_bib_dir, cks, verbosity):
             raise
 
     return ck_tuples
+
+
+def print_csv(cks, tags, include_url=False, include_venue=False):
+    click.echo('Type,Name,Tags,Status,ck,Author,title,year,date,url,venue')
+    spamwriter = csv.writer(sys.stdout)
+    for (ck, author, title, year, date, url, venue) in cks:
+        if ck in tags:
+            tag = ", ".join(tags[ck])
+        spamwriter.writerow(["Academic Journal", title, tag, "Imported", ck, author.replace(" and ", ", "), title, year, date, url, venue])
 
 def print_ck_tuples(cks, tags, include_url=False, include_venue=False):
     for (ck, author, title, year, date, url, venue) in cks:
