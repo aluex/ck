@@ -71,7 +71,7 @@ def download_bib(opener, user_agent, biburl, verbosity):
 
 def download_pdf(opener, user_agent, pdfurl, verbosity):
     if pdfurl is not None:
-        pdf_data = get_url(opener, pdfurl, verbosity, user_agent, "application/pdf")
+        pdf_data = get_url(opener, pdfurl, verbosity, user_agent)
         return pdf_data
     return None
 
